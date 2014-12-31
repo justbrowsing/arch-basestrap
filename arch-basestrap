@@ -1,7 +1,7 @@
 #!/bin/bash
 ####################
 ### arch-basestrap #
-version="0.4" ######
+version="0.5" ######
 ### JustBrowsing ###
 ####################
 
@@ -9,7 +9,7 @@ mirror="archlinux.supsec.org"
 release="2013.08.01"
 arch="i686"
 
-label="ARCH"
+label="arch-basestrap"
 imgSize="1600"
 locale="en_US"
 manpages="false"
@@ -26,11 +26,14 @@ isoFile="arch-basestrap.iso"
 
 bootstrap="http://${mirror}/iso/${release}/archlinux-bootstrap-${release}-${arch}.tar.gz";
 
-EXIT_STATUS() { echo "==> ERROR: $@"; CLEAN_UP; }
+EXIT_STATUS() { echo -e "\033[1m:::::> ERROR: $@\033[0m"; CLEAN_UP; exit 1; }
 
 CLEAN_UP()
 {
-  echo "==> Cleaning up";
+  echo -e "\033[1m:::::> Cleaning up\033[0m";
+  sync
+  sleep 1
+  sync
   umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
   umount "$mntDir/*/*" 2>/dev/null;
   umount "$mntDir/*" 2>/dev/null;
@@ -39,173 +42,329 @@ CLEAN_UP()
   rm -rf "$mntDir"
   rm -rf "${buildDir}/syslinux"
   mount -o remount,gid=5,mode=620 /dev/pts
+  sync
+}
+
+DOWNLOAD_BOOTSTRAP()
+{
+  # Download
+  cd "$tmpDir" || EXIT_STATUS "Couldn't cd into $tmpDir"
+  echo -e "\033[1m:::::> Downloading bootstrap\033[0m"
+  if [ ! -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ]; then
+    wget "$bootstrap" -O "archlinux-bootstrap-${release}-${arch}.tar.gz";
+  fi
+  [ -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ] || EXIT_STATUS "Download failed";
+}
+
+NEW_IMAGE()
+{
+  # Create raw image
+  cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
+  echo -e "\033[1m:::::> Creating raw image\033[0m"
+  if [ ! -f "$imgFile" ]; then
+    dd if=/dev/zero of="$imgFile" bs=1MB count="$imgSize" &&
+    chmod 777 "$imgFile"
+    parted -s -a optimal "$imgFile"
+    parted -s "$imgFile" mklabel msdos
+  fi
+  [ -f "$imgFile" ] || EXIT_STATUS "Raw image creation failed"
+  imageType=$(file "$imgFile" | awk -F ": " '{print $2}');
+  [ "$imageType" = "x86 boot sector" ] || EXIT_STATUS "Invalid partition table";
+}
+
+PART_IMAGE()
+{
+  # Partition image
+  echo -e "\033[1m:::::> Creating partition\033[0m"
+  cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
+  losetup -f "$imgFile" || EXIT_STATUS "Unable to mount virtDrive"
+  virtDrive=$(losetup -a 2>&1 | grep "${buildDir}/${imgFile}" | awk -F ":" '{print $1}');
+  [ -b "$virtDrive" ] || EXIT_STATUS "loopback failed"
+  fdisk -l "$virtDrive" || EXIT_STATUS "Invalid virtDrive"
+  virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
+  if [ ! -b "$virtPart" ]; then
+    parted -s "$virtDrive" mkpart primary 1 "$imgSize"
+    virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
+  fi
+  [ -b "$virtPart" ] || EXIT_STATUS "Failed to create partition"
+}
+
+FORMAT_IMAGE()
+{
+  # Create filesystem
+  echo -e "\033[1m:::::> Create filesystem\033[0m"
+  [ -b "$virtPart" ] || EXIT_STATUS "Failed to create partition"
+  virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
+  if [ "$virtFS" != "ext4" ]; then
+    mkfs.ext4 -L "$label" "$virtPart" || EXIT_STATUS "Failed to create EXT4 partition"
+    virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
+  fi
+  [ "$virtFS" = "ext4" ] || EXIT_STATUS "Filesystem check failed. Not ext4"
+}
+
+INSTALL_BASE()
+{
+  # Uncompress
+  echo -e "\033[1m:::::> Mounting partition\033[0m"
+  mount "$virtPart" "$mntDir" || EXIT_STATUS "Couldn't mount $mntDir"
+  cd "$mntDir" || EXIT_STATUS "Couldn't cd into $mntDir"
+  echo -e "\033[1m:::::> Uncompressing bootstrap\033[0m"
+  if [ ! -f "${mntDir}/etc/arch-release" ]; then
+    tar -xzpf "${tmpDir}/archlinux-bootstrap-${release}-${arch}.tar.gz" --strip-components=1;
+  fi
+  [ -f "${mntDir}/etc/arch-release" ] || EXIT_STATUS "Archive failed to decompress"
+}
+
+FIX_PACMAN()
+{
+  # Fix build files
+  sed -i 's/^#Server = /Server = /g' "${mntDir}/etc/pacman.d/mirrorlist"
+  echo "nameserver 8.8.8.8" > "${mntDir}/etc/resolv.conf"
+  [ -f "etc/pacman.conf.stock" ] || cp "${mntDir}/etc/pacman.conf" "${mntDir}/etc/pacman.conf.stock" 2>/dev/null
+  sed -i 's/^Architecture =.*/Architecture = i686/g' "${mntDir}/etc/pacman.conf"
+  #sed -i 's/^CheckSpace/#CheckSpace/g' "${mntDir}/etc/pacman.conf"
+  sed -i 's/^#Color/Color/g' "${mntDir}/etc/pacman.conf"
+}
+
+CREATE_CHROOT()
+{
+  # Enter chroot
+  cd "$buildDir"
+  echo -e "\033[1m:::::> Mounting chroot: ${mntDir}\033[0m"
+  mount -t proc proc "${mntDir}/proc/"
+  mount -t sysfs sys "${mntDir}/sys/"
+  mount -o bind /dev "${mntDir}/dev/"
+  mount -t devpts pts "${mntDir}/dev/pts"
+
+  mkdir -p "${tmpDir}/var-cache" "${tmpDir}/tmp-dir"
+  mount -o bind,exec,rw "${tmpDir}/var-cache" "${mntDir}/var/cache"
+  mount -o bind,exec,rw "${tmpDir}/tmp-dir" "${mntDir}/tmp"
+  mkdir -p "${mntDir}/var/cache/pacman/pkg"
+  mkdir -p "${mntDir}/var/cache/apacman/pkg"
+  mount -o remount,gid=5,mode=620 /dev/pts
+}
+
+BASE_CONFIG()
+{
+  # Set some basics
+  echo "${virtPart} / ext4 rw,relatime,data=ordered 0 1" > "${mntDir}/etc/fstab"
+  echo "$label" > "${mntDir}/etc/hostname"
+  timezone=$(readlink -e /etc/localtime 2>/dev/null);
+  if [ ! -z "$timezone" ]; then
+    chroot "$mntDir" ln -s "$timezone" /etc/localtime 2>/dev/null
+  fi
+}
+
+ENTER_CHROOT()
+{
+  read -t 5 -n 1 -p ":::::> Enter chroot (y/N): " input
+  echo "";
+  if [[ "$input" = [Yy] ]]; then
+    chroot "$mntDir" /bin/bash;
+  fi
+}
+
+GENERATE_ENTROPY()
+{
+  # Prepare keyring
+  if [ ! -f "${mntDir}/etc/.entropy" ]; then
+    [ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz" ] ||
+    wget "https://www.archlinux.org/packages/community/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
+    [ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz" ] || EXIT_STATUS "Unable to download haveged package"
+    chroot "$mntDir" pacman -U "haveged-latest-${arch}.pkg.tar.xz" --noconfirm
+    echo -e "\033[1m:::::> Generating entropy\033[0m"
+    chroot "$mntDir" /usr/sbin/haveged -w 1024 -v 1
+    chroot "$mntDir" pacman-key --init
+    chroot "$mntDir" pacman-key --populate archlinux
+    killall haveged
+    chroot "$mntDir" touch "/etc/.entropy"
+  fi
+}
+
+CORE_INSTALL()
+{
+  # Update system
+  chroot "$mntDir" mkdir -p /var/cache/{packer,pacman}/pkg
+  chroot "$mntDir" pacman -Syy
+  chroot "$mntDir" pacman -Su device-mapper --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+}
+
+UPDATE_KERNEL()
+{
+  chroot "$mntDir" sed -i "s/^PRESETS=.*/PRESETS=()/g" "/etc/mkinitcpio.d/linux.preset" 2>/dev/null
+  chroot "$mntDir" pacman -S linux linux-headers --noconfirm
+  chroot "$mntDir" rm "/boot/initramfs-linux-fallback.img" 2>/dev/null
+  chroot "$mntDir" sed -i 's/^HOOKS=.*/HOOKS="base udev modconf block filesystems keyboard shutdown"/g' "/etc/mkinitcpio.conf"
+  line=$(grep -n "^# COMPRESSION_OPTIONS" "${mntDir}/etc/mkinitcpio.conf" | awk -F : '{print $1}');
+  line=$((line-1));
+  chroot "$mntDir" sed -i "${line}iCOMPRESSION=""\"xz""\"" "/etc/mkinitcpio.conf"
+  chroot "$mntDir" sed -i "s/^PRESETS=.*/PRESETS=('default')/g" "/etc/mkinitcpio.d/linux.preset"
+  chroot "$mntDir" mkinitcpio -p linux
+  cp "${mntDir}/boot/vmlinuz-linux" "${tmpDir}/vmlinuz-linux"
+  cp "${mntDir}/boot/initramfs-linux.img" "${tmpDir}/initramfs-linux.img"
 }
 
 CREATE_DIET()
 {
   docdiet="${mntDir}/opt/docdiet"
   echo '#!/bin/bash' > "$docdiet"
-  echo "before=$(df  -H | grep ' /$' | awk '{print $4}')" >> "$docdiet"
   echo 'shopt -s extglob' >> "$docdiet"
-  echo '[ ! -z "$1" ] && rm -rf /usr/share/locale/!($1)' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -rf/usr/share/{man,man?}' >> "$docdiet"
-  echo "after=$(df  -H | grep ' /$' | awk '{print $4}')" >> "$docdiet"
-  echo 'echo "==> $((((before-after)*1024)/10**6)) MB lost"' >> "$docdiet"
+  echo 'cd /usr/share/locale' >> "$docdiet"
+  echo '[ ! -z "$1" ] && rm -rf !($1)' >> "$docdiet"
+  echo '[ "$2" = "false" ] && rm -rf /usr/share/{man,man?}' >> "$docdiet"
+  echo '[ "$2" = "false" ] && rm -rf /usr/share/doc' >> "$docdiet"
+  echo 'shopt -u extglob' >> "$docdiet"
   chmod +x "$docdiet"
 }
 
+GO_ON_DIET()
+{
+  # Go on a diet
+  echo -en "\033[1m:::::> Go on a diet ... "
+  before=$(df 2>/dev/null | grep "^$virtPart" | awk '{print $4}');
+  chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages";
+  after=$(df 2>/dev/null | grep "^$virtPart" | awk '{print $4}');
+  echo -e "lost $((((after-before)*1024)/10**6)) MB\033[0m"
+  
+}
+
+DEV_INSTALL()
+{
+  # Install dev packages
+  read -t 5 -n 1 -p ":::::> Install dev packages (Y/n): " input
+  echo "";
+  if [[ "$input" != [Nn] ]]; then
+    chroot "$mntDir" pacman -S base base-devel --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  fi
+}
+
+ENABLE_ETHERNET()
+{
+  # Enable networking
+  chroot "$mntDir" pacman -S dhcpcd iproute2 --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" ln -s /usr/lib/systemd/system/dhcpcd.service /etc/systemd/system/multi-user.target.wants/dhcpcd.service 2>/dev/null
+}
+
+
+ENABLE_AUR()
+{
+  # Install dependencies
+  packerDepends="binutils file wget ca-certificates jshon git pcre"
+  compileDepends="make gcc autoconf automake patch pkg-config tar"
+  chroot "$mntDir" pacman -S $packerDepends $compileDepends --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+
+  # Install packer
+  echo -e "\033[1m:::::> Installing packer\033[0m"
+  chroot "$mntDir" mkdir -p "/opt/aur/packer"
+  chroot "$mntDir" wget "https://aur.archlinux.org/packages/pa/packer/PKGBUILD" -O "/opt/aur/packer/PKGBUILD"
+  chroot "$mntDir" su -c 'cd /opt/aur/packer && makepkg --asroot --noconfirm -i --needed'
+  aurTest=$(chroot "$mntDir" packer -Ss justbrowsing-webapps 2>/dev/null);
+  [ -z "$aurTest" ] && EXIT_STATUS "Cannot search AUR"
+
+  # Patch packer
+  packer="/usr/bin/packer"
+  apacman="/usr/bin/apacman"
+  if [ ! -f "${mntDir}/$apacman" ]; then
+    echo -e "\033[1m:::::> Patching packer as apacman\033[0m"
+    chroot "$mntDir" cp "$packer" "$apacman"
+    chroot "$mntDir" mkdir -p "/var/cache/apacman/pkg"
+    line=$(grep -n "pacmanconf=" "${mntDir}/$apacman" | awk -F ":" '{print $1}');
+    chroot "$mntDir" sed -i "${line}asaveDir='/var/cache/packer/pkg'" $apacman; 
+    line=$(grep -n "The build failed" "${mntDir}/$apacman" | awk -F ":" '{print $1}');
+    chroot "$mntDir" sed -i "${line}a%%%" $apacman; line=$((line+1));
+    chroot "$mntDir" sed -i "${line}a%%%  if [ ! -d \$saveDir ]; then" $apacman; line=$((line+1));
+    chroot "$mntDir" sed -i "${line}a%%%    runasroot mkdir -p \$saveDir" $apacman; line=$((line+1));
+    chroot "$mntDir" sed -i "${line}a%%%  fi" $apacman; line=$((line+1));
+    chroot "$mntDir" sed -i "${line}a%%%  runasroot cp \$pkgname-*\$PKGEXT \$saveDir/" $apacman; line=$((line+1));
+    chroot "$mntDir" sed -i "${line}a%%%  echo ""\"Saved: \$(ls \$pkgname-*\$PKGEXT)""\";" $apacman; line=$((line+1));
+    chroot "$mntDir" sed -i "${line}a%%%" $apacman;
+    chroot "$mntDir" sed -i 's/^%%%//g' $apacman;
+    chroot "$mntDir" sed -i 's/makepkg $MAKEPKGOPTS/makepkg -A $MAKEPKGOPTS/g' $apacman;
+  fi;
+}
+
+BOOT_INSTALL()
+{
+  # Install syslinux bootloader
+  echo -e "\033[1m:::::> Installing bootloader\033[0m"
+  chroot "$mntDir" pacman -S syslinux --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" syslinux-install_update -i -a -m
+  chroot "$mntDir" sed -i 's/ root=.*/ root=\/dev\/sda1 rw init=\/usr\/lib\/systemd\/systemd/g' "/boot/syslinux/syslinux.cfg"
+  lineStart=$(grep -n "LABEL archfallback" "${mntDir}/boot/syslinux/syslinux.cfg" | awk -F : '{print $1}');
+  if [[ "$lineStart" = [0-9]* ]]; then
+    lineEnd=$((lineStart+4));
+    chroot "$mntDir" sed -i "${lineStart},${lineEnd}d" "/boot/syslinux/syslinux.cfg"
+  fi;
+}
+
+COMPIZ_INSTALL()
+{
+  # Install Compiz WM
+  xorgDepends="xorg-server xorg-xinit xf86-video-fbdev xf86-video-vesa xf86-input-keyboard xf86-input-mouse mesa-libgl"
+#compiz compizconfig-backend-gconf
+  compizMain="compiz-bcop compizconfig-python libcompizconfig"
+  compizAddons="compiz-fusion-plugins-main compiz-fusion-plugins-extra emerald emerald-themes"
+  compizConfig="ccsm fusion-icon-fixed python2-sexy"
+  chroot "$mntDir" pacman -S $xorgDepends --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" pacman -U /var/cache/pacman/pkg/compiz* --noconfirm
+  chroot "$mntDir" apacman -S $compizMain $compizAddons $compizConfig --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+}
+
+CLOSE_CHROOT()
+{
+  echo -e "\033[1m:::::> Exiting chroot\033[0m"
+  cd "$buildDir"
+  sync
+  sleep 1
+  sync
+  umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null
+  umount "$mntDir/*/*" 2>/dev/null
+  umount "$mntDir/*" 2>/dev/null
+  sleep 1
+  sync
+  umount "$mntDir"
+}
+
+###########################
+
 # Setup
-echo "==> Running arch-basestrap"
+echo -e "\033[1m:::::> Running arch-basestrap\033[0m"
 [ "$UID" = "0" ] || EXIT_STATUS "Need to be root"
 mkdir -p "$tmpDir" "$buildDir" "$mntDir"
 trap CLEAN_UP INT;
 
-# Download
-cd "$tmpDir" || EXIT_STATUS "Couldn't cd into $tmpDir"
-echo "==> Downloading bootstrap"
-if [ ! -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ]; then
-  wget "$bootstrap" -O "archlinux-bootstrap-${release}-${arch}.tar.gz";
-fi
-[ -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ] || EXIT_STATUS "Download failed"
-
-# Create raw image
-cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
-[ -f "$imgFile" ] && rm "$imgFile";
-echo "==> Creating raw image"
-if [ ! -f "$imgFile" ]; then
-  dd if=/dev/zero of="$imgFile" bs=1MB count="$imgSize" &&
-  chmod 777 "$imgFile"
-  parted -s -a optimal "$imgFile"
-  parted -s "$imgFile" mklabel msdos
-fi
-[ -f "$imgFile" ] || EXIT_STATUS "Raw image creation failed"
-imageType=$(file "$imgFile" | awk -F ": " '{print $2}');
-[ "$imageType" = "x86 boot sector" ] || EXIT_STATUS "Invalid partition table"
-
-# Partition image
-echo "==> Creating partition"
-losetup -f "$imgFile" || EXIT_STATUS "Unable to mount virtDrive"
-virtDrive=$(losetup -a 2>&1 | grep "${buildDir}/${imgFile}" | awk -F ":" '{print $1}');
-[ -b "$virtDrive" ] || EXIT_STATUS "loopback failed"
-fdisk -l "$virtDrive" || EXIT_STATUS "Invalid virtDrive"
-virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
-if [ ! -b "$virtPart" ]; then
-  parted -s "$virtDrive" mkpart primary 1 "$imgSize"
-  virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
-fi
-[ -b "$virtPart" ] || EXIT_STATUS "Failed to create partition"
-
-# Create filesystem
-echo "==> Create filesystem"
-virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
-if [ "$virtFS" != "ext4" ]; then
-  mkfs.ext4 -L "$label" "$virtPart" || EXIT_STATUS "Failed to create EXT4 partition"
-  virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
-fi
-[ "$virtFS" = "ext4" ] || EXIT_STATUS "Filesystem check failed. Not ext4"
-
-# Uncompress
-echo "==> Mounting partition"
-mount "$virtPart" "$mntDir" || EXIT_STATUS "Couldn't mount $mntDir"
-cd "$mntDir" || EXIT_STATUS "Couldn't cd into $mntDir"
-echo "==> Uncompressing bootstrap"
-if [ ! -f "${mntDir}/etc/arch-release" ]; then
-  tar -xzpf "${tmpDir}/archlinux-bootstrap-${release}-${arch}.tar.gz" --strip-components=1;
-fi
-[ -f "${mntDir}/etc/arch-release" ] || EXIT_STATUS "Archive failed to decompress"
-
-# Fix build files
-sed -i 's/^#Server = /Server = /g' etc/pacman.d/mirrorlist
-echo "nameserver 8.8.8.8" > etc/resolv.conf
-[ -f "etc/pacman.conf.stock" ] || cp etc/pacman.conf etc/pacman.conf.stock 2>/dev/null
-sed -i 's/^Architecture =.*/Architecture = i686/g' etc/pacman.conf
-sed -i 's/^CheckSpace/#CheckSpace/g' etc/pacman.conf
-
-# Enter chroot
-cd "$buildDir"
-echo "==> Mounting chroot: ${mntDir}"
-mount -t proc proc "${mntDir}/proc/"
-mount -t sysfs sys "${mntDir}/sys/"
-mount -o bind /dev "${mntDir}/dev/"
-mount -t devpts pts "${mntDir}/dev/pts"
-
-mkdir -p "${tmpDir}/var-cache" "${tmpDir}/tmp-dir"
-mount -o bind,exec,rw "${tmpDir}/var-cache" "${mntDir}/var/cache"
-mount -o bind,exec,rw "${tmpDir}/tmp-dir" "${mntDir}/tmp"
-mkdir -p "${mntDir}/var/cache/pacman/pkg"
-[ -d "${pkgDir}" ] && cp "${pkgDir}"/* "${tmpDir}/var-cache/pacman/pkg/" 2>/dev/null;
-
-read -t 5 -n 1 -p "==> Enter chroot (y/N): " input
-echo "";
-if [[ "$input" = [Yy] ]]; then
-  chroot "$mntDir" /bin/bash;
+# Image overwrite check
+if [ -f "${buildDir}/$imgFile" ]; then
+  read -t 5 -n 1 -p ":::::> Overwrite image (y/N): " input
+  echo "";
+  [[ "$input" = [Yy] ]] && rm "${buildDir}/$imgFile"
 fi
 
-# Set some basics
-echo "$hostname" > "${mntDir}/etc/hostname"
-timezone=$(readlink -e /etc/localtime 2>/dev/null);
-if [ ! -z "$timezone" ]; then
-  chroot "$mntDir" ln -s "$timezone" /etc/localtime
-fi
 
-# Prepare keyring
-wget "https://www.archlinux.org/packages/community/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
-[ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"  ] || EXIT_STATUS "Unable to download haveged package"
-chroot "$mntDir" pacman -U "haveged-latest-${arch}.pkg.tar.xz" --noconfirm
-chroot "$mntDir" /usr/sbin/haveged -w 1024 -v 1
-chroot "$mntDir" pacman-key --init
-chroot "$mntDir" pacman-key --populate archlinux
-killall haveged
-
-# Make some scripts
+DOWNLOAD_BOOTSTRAP
+NEW_IMAGE
+PART_IMAGE
+FORMAT_IMAGE
+INSTALL_BASE
+FIX_PACMAN
+CREATE_CHROOT
+BASE_CONFIG
+ENTER_CHROOT
+GENERATE_ENTROPY
+CORE_INSTALL
+[[ $@ = *--kernel* ]] && UPDATE_KERNEL
 CREATE_DIET
+GO_ON_DIET
+[[ $@ = *--dev* ]] && DEV_INSTALL
+ENABLE_ETHERNET
+ENABLE_AUR
+BOOT_INSTALL
+[[ $@ = *--compiz* ]] && COMPIZ_INSTALL
+GO_ON_DIET
+CLOSE_CHROOT
 
-# Update system
-chroot "$mntDir" mkdir -p /var/cache/{packer,pacman}/pkg
-chroot "$mntDir" pacman -Syy
-chroot "$mntDir" pacman -Su archiso device-mapper --needed --noconfirm
-chroot "$mntDir" pacman -S linux linux-headers --noconfirm
-sed -i 's/^HOOKS=.*/HOOKS="base udev modconf block filesystems keyboard shutdown"/g' "${mntDir}/etc/mkinitcpio.conf"
-chroot "$mntDir" mkinitcpio -p linux
-cp "${mntDir}/boot/vmlinuz-linux" "${tmpDir}/vmlinuz-linux"
-cp "${mntDir}/boot/initramfs-linux.img" "${tmpDir}/initramfs-linux.img"
-
-# Go on a diet
-chroot "$mntDir" "/opt/docdiet"
-
-# Install dev packages
-read -t 5 -n 1 -p "==> Install dev packages (Y/n): " input
-echo "";
-if [[ "$input" != [Nn] ]]; then
-  chroot "$mntDir" pacman -S base base-devel --needed --noconfirm
-fi
-
-# Enable networking
-chroot "$mntDir" pacman -S dhcpcd iproute2 --needed --noconfirm
-chroot "$mntDir" ln -s /usr/lib/systemd/system/dhcpcd.service /etc/systemd/system/multi-user.target.wants/dhcpcd.service
-
-# Install syslinux bootloader
-echo "==> Installing bootloader"
-chroot "$mntDir" pacman -S arch-install-scripts syslinux --needed --noconfirm
-echo "${virtPart} / ext4 rw,relatime,data=ordered 0 1" > "${mntDir}/etc/fstab"
-chroot "$mntDir" syslinux-install_update -i -a -m
-sed -i 's/ root=.*/ root=\/dev\/sda1 rw/g' "${mntDir}/boot/syslinux/syslinux.cfg"
-
-# Go on a diet
-chroot "$mntDir" "/opt/docdiet"
-
-echo "==> Exiting chroot"
-cd "$buildDir"
-umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null
-umount "$mntDir/*/*" 2>/dev/null
-umount "$mntDir/*" 2>/dev/null
-sleep 1
-sync
-umount "$mntDir"
-
-
-# Clean up
 CLEAN_UP
-echo "==> [DONE]"
+du -s --si "${buildDir}/$imgFile"
+echo -e "\033[1m:::::> [DONE]\033[0m"
 
 ### END ###
