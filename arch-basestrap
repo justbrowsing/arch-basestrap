@@ -1,0 +1,159 @@
+#!/bin/bash
+####################
+### arch-basestrap #
+version="0.1" ######
+### JustBrowsing ###
+####################
+
+mirror="archlinux.supsec.org"
+release="2013.08.01"
+arch="i686"
+
+imgSize="1600"
+imgFile="archbase.img"
+tmpDir="/opt/arch-tmp"
+buildDir="/opt/arch-build"
+mntDir="/opt/arch-iso"
+
+bootstrap="http://${mirror}/iso/${release}/archlinux-bootstrap-${release}-${arch}.tar.gz";
+
+EXIT_STATUS() { echo "==> ERROR: $@"; CLEAN_UP; exit 1; }
+
+CLEAN_UP()
+{
+  echo "==> Cleaning up";
+  umount "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
+  umount "$mntDir/*/*" 2>/dev/null;
+  umount "$mntDir/*" 2>/dev/null;
+  umount "$mntDir" 2>/dev/null;
+  losetup -d "$virtDrive";
+  rm -rf "$mntDir"
+}
+
+
+# Setup
+echo "==> Running arch-basestrap"
+[ "$UID" = "0" ] || EXIT_STATUS "Need to be root"
+mkdir -p "$tmpDir" "$buildDir" "$mntDir"
+trap CLEAN_UP INT;
+
+# Download
+cd "$tmpDir" || EXIT_STATUS "Couldn't cd into $tmpDir"
+echo "==> Downloading bootstrap"
+if [ ! -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ]; then
+  wget "$bootstrap" -O "archlinux-bootstrap-${release}-${arch}.tar.gz";
+fi
+[ -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ] || EXIT_STATUS "Download failed"
+
+# Create raw image
+cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
+echo "==> Creating raw image"
+if [ ! -f "$imgFile" ]; then
+  dd if=/dev/zero of="$imgFile" bs=1MB count="$imgSize" &&
+  parted -s "$imgFile" mklabel msdos
+fi
+[ -f "$imgFile" ] || EXIT_STATUS "Raw image creation failed"
+imageType=$(file "$imgFile" | awk -F ": " '{print $2}');
+[ "$imageType" = "x86 boot sector" ] || EXIT_STATUS "Invalid partition table"
+
+# Partition image
+losetup -f "$imgFile" || EXIT_STATUS "Unable to mount virtDrive"
+virtDrive=$(losetup -a 2>&1 | grep "${buildDir}/${imgFile}" | awk -F ":" '{print $1}');
+[ -b "$virtDrive" ] || EXIT_STATUS "loopback failed"
+fdisk -l "$virtDrive" || EXIT_STATUS "Invalid virtDrive"
+parted -s "$virtDrive" mkpart primary 0 "$imgSize"
+virtPart=$(fdisk -l /dev/loop0 2>&1 | tail -n 1 | awk '{print $1}');
+if [ ! -b "$virtPart" ]; then
+  parted -s "$virtDrive" mkpart primary 0 "$imgSize"
+  virtPart=$(fdisk -l /dev/loop0 2>&1 | tail -n 1 | awk '{print $1}');
+fi
+[ -b "$virtPart" ] || EXIT_STATUS "Failed to create partition"
+mkfs.ext4 "$virtPart" || EXIT_STATUS "Failed to create EXT4 partition"
+virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
+[ "$virtFS" = "ext4" ] || EXIT_STATUS "Filesystem check failed. Not ext4"
+mount "$virtPart" "$mntDir"
+
+# Uncompress
+cd "$mntDir" || EXIT_STATUS "Couldn't cd into $mntDir"
+echo "==> Uncompressing bootstrap"
+if [ ! -f "${mntDir}/etc/arch-release" ]; then
+  tar -xzpf "${tmpDir}/archlinux-bootstrap-${release}-${arch}.tar.gz" --strip-components=1;
+fi
+[ -f "${mntDir}/etc/arch-release" ] || EXIT_STATUS "Archive failed to decompress"
+
+# Fix build files
+sed -i 's/^#Server = /Server = /g' etc/pacman.d/mirrorlist
+echo "nameserver 8.8.8.8" > etc/resolv.conf
+[ -f "etc/pacman.conf.stock" ] || cp etc/pacman.conf etc/pacman.conf.stock 2>/dev/null
+sed -i 's/^Architecture =.*/Architecture = i686/g' etc/pacman.conf
+sed -i 's/^CheckSpace/#CheckSpace/g' etc/pacman.conf
+
+# Fix livecd
+[ -f "etc/mkinitcpio.conf.stock" ] || cp etc/mkinitcpio.conf etc/mkinitcpio.conf.stock 2>/dev/null
+echo 'HOOKS="base udev plymouth timestamp archiso_shutdown archiso archiso_loop_mnt archiso_kms block filesystems keyboard"' > etc/mkinitcpio.conf
+echo 'COMPRESSION="xz"' >> etc/mkinitcpio.conf
+cp etc/mkinitcpio.conf etc/mkinitcpio.conf.livecd
+if [ -f "etc/fstab.stock" ]; then
+  cp etc/fstab.stock etc/fstab 2>/dev/null
+else 
+  cp etc/fstab etc/fstab.stock 2>/dev/null
+fi
+if [ -f "etc/mtab.stock" ]; then
+  cp etc/mtab.stock etc/mtab 2>/dev/null
+else 
+  cp etc/mtab etc/mtab.stock 2>/dev/null
+fi
+
+# Enter chroot
+cd "$buildDir"
+echo "==> Mounting chroot: ${mntDir}"
+mount -t proc proc "${mntDir}/proc/"
+mount -t sysfs sys "${mntDir}/sys/"
+mount -o bind /dev "${mntDir}/dev/"
+mount -t devpts pts "${mntDir}/dev/pts"
+
+read -t 5 -n 1 -p "==> Enter chroot (y/N): " input
+echo "";
+if [[ "$input" = [Yy] ]]; then
+  chroot "$mntDir" /bin/bash;
+fi
+
+# Set some basics
+echo "$hostname" > "${mntDir}/etc/hostname"
+timezone=$(readlink -e /etc/localtime 2>/dev/null);
+if [ ! -z "$timezone" ]; then
+  chroot "$mntDir" ln -s "$timezone" /etc/localtime
+fi
+
+# Prepare keyring
+#sourceURL="https://projects.archlinux.org/svntogit/community.git/plain/trunk"
+#curl -s "${sourceURL}/PKGBUILD?h=packages/haveged" -o "${mntDir}/PKGBUILD"
+#curl -s "${sourceURL}/service?h=packages/haveged" -o "${mntDir}/service"
+#chroot "$mntDir" makepkg --asroot -i
+wget "https://www.archlinux.org/packages/community/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
+chroot "$mntDir" pacman -U "haveged-latest-${arch}.pkg.tar.xz" --noconfirm
+chroot "$mntDir" /usr/sbin/haveged -w 1024 -v 1
+chroot "$mntDir" pacman-key --init
+chroot "$mntDir" pacman-key --populate archlinux
+chroot "$mntDir" pkill haveged
+
+# Update system
+chroot "$mntDir" pacman -Syy
+chroot "$mntDir" pacman -Su archiso linux linux-headers --noconfirm
+chroot "$mntDir" mkinitcpio -p linux
+cp "${mntDir}/boot/vmlinuz-linux" "${tmpDir}/vmlinuz-linux"
+cp "${mntDir}/boot/initramfs-linux.img" "${tmpDir}/initramfs-linux.img"
+
+# Install additional packages
+chroot "$mntDir" pacman -S base base-devel --needed --noconfirm
+
+# Prepare livecd
+cp etc/pacman.conf.stock etc/pacman.conf
+cp etc/mkinitcpio.conf.stock etc/mkinitcpio.conf
+rm "${mntDir}/etc/fstab" "${mntDir}/etc/mtab" 
+
+# Clean up
+CLEAN_UP
+echo "==> [DONE]"
+
+### END ###
