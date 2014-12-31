@@ -1,7 +1,7 @@
 #!/bin/bash
 ####################
 ### arch-basestrap #
-version="0.7" ######
+version="0.8" ######
 ### JustBrowsing ###
 ####################
 
@@ -18,7 +18,8 @@ tmpDir="/opt/arch-tmp"
 buildDir="/opt/arch-build"
 mntDir="/opt/arch-iso"
 
-imgFile="archbase.img"
+imgFile="qemu.qcow2"
+#imgFile="archbase.img"
 ext4File="root-image.fs"
 sfsFile="root-image.fs.sfs"
 isoFile="arch-basestrap.iso"
@@ -34,13 +35,19 @@ CLEAN_UP()
   sync
   sleep 1
   sync
+echo "debug 1"
   umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
   umount "$mntDir/*/*" 2>/dev/null;
   umount "$mntDir/*" 2>/dev/null;
   umount "$mntDir" 2>/dev/null;
+echo "debug 2"
+  qemu-nbd -d "$virtPart"
+echo "debug 3"
   losetup -d "$virtDrive";
+echo "debug 4"
   rm -rf "$mntDir"
   rm -rf "${buildDir}/syslinux"
+echo "debug 5"
   mount -o remount,gid=5,mode=620 /dev/pts
   sync
 }
@@ -56,7 +63,27 @@ DOWNLOAD_BOOTSTRAP()
   [ -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ] || EXIT_STATUS "Download failed";
 }
 
-NEW_IMAGE()
+QCOW_IMAGE()
+{
+  # Create qcow2 image
+  cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
+  echo -e "\033[1m:::::> Creating qcow2 image\033[0m"
+  virtPart="/dev/nbd0"
+  if [ ! -f "$imgFile" ]; then
+    qemu-img create -f qcow2 "$imgFile" "${imgSize}M"
+    chmod 777 "$imgFile"
+  fi
+  
+  modprobe nbd max_part=16
+  [ -b "$virtPart" ] || EXIT_STATUS "nbd error"
+  qemu-nbd -c "$virtPart" "$imgFile"
+  
+  [ -f "$imgFile" ] || EXIT_STATUS "qcow2 image creation failed"
+  imageType=$(file "$imgFile" | awk -F ": " '{print $2}'| awk -F "," '{print $1}');
+  [ "$imageType" = "QEMU QCOW Image (v2)" ] || EXIT_STATUS "Invalid file format";
+}
+
+RAW_IMAGE()
 {
   # Create raw image
   cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
@@ -176,7 +203,7 @@ ENTER_CHROOT()
 JUST_CHROOT()
 {
   chroot "$mntDir" /bin/bash;
-GO_ON_DIET --removeaur
+#GO_ON_DIET --removeaur
   CLOSE_CHROOT;
   CLEAN_UP;
   exit 0;
@@ -187,7 +214,7 @@ GENERATE_ENTROPY()
   # Prepare keyring
   if [ ! -f "${mntDir}/etc/.entropy" ]; then
     [ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz" ] ||
-    wget "https://www.archlinux.org/packages/community/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
+    wget "https://www.archlinux.org/packages/extra/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
     [ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz" ] || EXIT_STATUS "Unable to download haveged package"
     chroot "$mntDir" pacman -U "haveged-latest-${arch}.pkg.tar.xz" --noconfirm
     echo -e "\033[1m:::::> Generating entropy\033[0m"
@@ -225,6 +252,19 @@ UPDATE_KERNEL()
   chroot "$mntDir" mkinitcpio -p linux
   cp "${mntDir}/boot/vmlinuz-linux" "${tmpDir}/vmlinuz-linux"
   cp "${mntDir}/boot/initramfs-linux.img" "${tmpDir}/initramfs-linux.img"
+}
+
+DEFAULT_USER()
+{
+  userName="user"
+  userDir="/home"
+  [ ! -z "$1" ] && userName="$1"
+  [ ! -z "$2" ] && userDir="$2"
+  chroot "$mntDir" mkdir -p "${userDir}"
+  [ -d "${mntDir}${userDir}" ] && userDir="${userDir}/${userName}"
+  chroot "$mntDir" useradd -U -m -d "${userDir}" "${userName}"
+  chroot "$mntDir" chown -R ${userName}:${userName} "${userDir}"
+
 }
 
 CREATE_DIET()
@@ -365,6 +405,23 @@ MAXIMA_INSTALL()
   chroot "$mntDir" sed -i 's/^ShowTips=.*/ShowTips=0/g' "/home/user/.wxMaxima"
 }
 
+FOSSGAMES_INSTALL()
+{
+  # Install FOSS games
+  xorgDeps="xorg-server xorg-xinit xf86-input-evdev xf86-input-synaptics xf86-input-keyboard xf86-input-mouse mesa-libgl"
+  videoDrivers="xf86-video-fbdev xf86-video-vesa xf86-video-intel xf86-video-nouveau ati-dri"
+  vmDrivers="xf86-video-qxl xf86-video-vmware xf86-input-vmmouse"
+  desktopDeps="i3-wm xpenguins"
+  gameDeps="python2-imaging"
+  binDeps="extremetuxracer frozen-bubble gbrainy hex-a-hop paintown mari0 neverball supertux supertuxkart tuxpuck"
+  srcDeps="anagramrama burgerspace enigma_sdl gltron greed magicor meandmyshadow methane numptyphysics-svn"
+  moreDeps="aisleriot deckcards slysics touchmegames lynsol"
+  echo -e "\033[1m:::::> Installing FOSS games recipe\033[0m"
+  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" pacman -S $desktopDeps $gameDeps $binDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" apacman -S $srcDeps $vmDrivers --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+}
+
 CLOSE_CHROOT()
 {
   echo -e "\033[1m:::::> Exiting chroot\033[0m"
@@ -397,8 +454,9 @@ fi
 
 
 DOWNLOAD_BOOTSTRAP
-NEW_IMAGE
-PART_IMAGE
+#RAW_IMAGE
+QCOW_IMAGE
+#PART_IMAGE
 FORMAT_IMAGE
 INSTALL_BASE
 FIX_PACMAN
@@ -407,6 +465,8 @@ BASE_CONFIG
 [[ $@ = *--chroot* ]] && JUST_CHROOT
 GENERATE_ENTROPY
 CORE_INSTALL
+  #JUST_CHROOT
+
 [[ $@ = *--kernel* ]] && UPDATE_KERNEL
 CREATE_DIET
 GO_ON_DIET
@@ -417,6 +477,7 @@ BOOT_INSTALL
 [[ $@ = *--compiz* ]] && COMPIZ_INSTALL
 [[ $@ = *--justbrowsing* ]] && JB_INSTALL
 [[ $@ = *--maxima* ]] && MAXIMA_INSTALL
+[[ $@ = *--games* ]] && FOSSGAMES_INSTALL
 ENTER_CHROOT
 GO_ON_DIET
 GO_ON_DIET --removeaur
