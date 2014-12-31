@@ -1,7 +1,7 @@
 #!/bin/bash
 ####################
 ### arch-basestrap #
-version="0.1" ######
+version="0.3" ######
 ### JustBrowsing ###
 ####################
 
@@ -9,25 +9,30 @@ mirror="archlinux.supsec.org"
 release="2013.08.01"
 arch="i686"
 
+label="ARCH"
 imgSize="1600"
 imgFile="archbase.img"
+ext4File="root-image.fs"
+sfsFile="root-image.fs.sfs"
+isoFile="arch-basestrap.iso"
 tmpDir="/opt/arch-tmp"
 buildDir="/opt/arch-build"
 mntDir="/opt/arch-iso"
 
 bootstrap="http://${mirror}/iso/${release}/archlinux-bootstrap-${release}-${arch}.tar.gz";
 
-EXIT_STATUS() { echo "==> ERROR: $@"; CLEAN_UP; exit 1; }
+EXIT_STATUS() { echo "==> ERROR: $@"; }
 
 CLEAN_UP()
 {
   echo "==> Cleaning up";
-  umount "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
+  umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
   umount "$mntDir/*/*" 2>/dev/null;
   umount "$mntDir/*" 2>/dev/null;
   umount "$mntDir" 2>/dev/null;
   losetup -d "$virtDrive";
   rm -rf "$mntDir"
+  rm -rf "${buildDir}/syslinux"
 }
 
 
@@ -57,23 +62,31 @@ imageType=$(file "$imgFile" | awk -F ": " '{print $2}');
 [ "$imageType" = "x86 boot sector" ] || EXIT_STATUS "Invalid partition table"
 
 # Partition image
+echo "==> Creating partition"
 losetup -f "$imgFile" || EXIT_STATUS "Unable to mount virtDrive"
 virtDrive=$(losetup -a 2>&1 | grep "${buildDir}/${imgFile}" | awk -F ":" '{print $1}');
 [ -b "$virtDrive" ] || EXIT_STATUS "loopback failed"
 fdisk -l "$virtDrive" || EXIT_STATUS "Invalid virtDrive"
-parted -s "$virtDrive" mkpart primary 0 "$imgSize"
-virtPart=$(fdisk -l /dev/loop0 2>&1 | tail -n 1 | awk '{print $1}');
+virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
 if [ ! -b "$virtPart" ]; then
   parted -s "$virtDrive" mkpart primary 0 "$imgSize"
-  virtPart=$(fdisk -l /dev/loop0 2>&1 | tail -n 1 | awk '{print $1}');
+  virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
 fi
 [ -b "$virtPart" ] || EXIT_STATUS "Failed to create partition"
-mkfs.ext4 "$virtPart" || EXIT_STATUS "Failed to create EXT4 partition"
+
+# Create filesystem
+echo "==> Create filesystem"
 virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
+if [ "$virtFS" != "ext4" ]; then
+  mkfs.ext4 -L "$label" "$virtPart" || EXIT_STATUS "Failed to create EXT4 partition"
+  virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
+fi
 [ "$virtFS" = "ext4" ] || EXIT_STATUS "Filesystem check failed. Not ext4"
-mount "$virtPart" "$mntDir"
+
 
 # Uncompress
+echo "==> Mounting partition"
+mount "$virtPart" "$mntDir" || EXIT_STATUS "Couldn't mount $mntDir"
 cd "$mntDir" || EXIT_STATUS "Couldn't cd into $mntDir"
 echo "==> Uncompressing bootstrap"
 if [ ! -f "${mntDir}/etc/arch-release" ]; then
@@ -90,7 +103,7 @@ sed -i 's/^CheckSpace/#CheckSpace/g' etc/pacman.conf
 
 # Fix livecd
 [ -f "etc/mkinitcpio.conf.stock" ] || cp etc/mkinitcpio.conf etc/mkinitcpio.conf.stock 2>/dev/null
-echo 'HOOKS="base udev plymouth timestamp archiso_shutdown archiso archiso_loop_mnt archiso_kms block filesystems keyboard"' > etc/mkinitcpio.conf
+echo 'HOOKS="base udev timestamp archiso_shutdown archiso archiso_loop_mnt archiso_kms block filesystems keyboard"' > etc/mkinitcpio.conf
 echo 'COMPRESSION="xz"' >> etc/mkinitcpio.conf
 cp etc/mkinitcpio.conf etc/mkinitcpio.conf.livecd
 if [ -f "etc/fstab.stock" ]; then
@@ -112,6 +125,12 @@ mount -t sysfs sys "${mntDir}/sys/"
 mount -o bind /dev "${mntDir}/dev/"
 mount -t devpts pts "${mntDir}/dev/pts"
 
+mkdir -p "${buildDir}/var-cache" "${buildDir}/tmp-dir"
+mount -o bind,exec,rw "${buildDir}/var-cache" "${mntDir}/var/cache"
+mount -o bind,exec,rw "${buildDir}/tmp-dir" "${mntDir}/tmp"
+mkdir -p "${mntDir}/var/cache/pacman/pkg"
+[ -d "${pkgDir}" ] && cp "${pkgDir}"/* "${buildDir}/var-cache/pacman/pkg/" 2>/dev/null;
+
 read -t 5 -n 1 -p "==> Enter chroot (y/N): " input
 echo "";
 if [[ "$input" = [Yy] ]]; then
@@ -126,31 +145,63 @@ if [ ! -z "$timezone" ]; then
 fi
 
 # Prepare keyring
-#sourceURL="https://projects.archlinux.org/svntogit/community.git/plain/trunk"
-#curl -s "${sourceURL}/PKGBUILD?h=packages/haveged" -o "${mntDir}/PKGBUILD"
-#curl -s "${sourceURL}/service?h=packages/haveged" -o "${mntDir}/service"
-#chroot "$mntDir" makepkg --asroot -i
 wget "https://www.archlinux.org/packages/community/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
+[ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"  ] || EXIT_STATUS "Unable to download haveged package"
 chroot "$mntDir" pacman -U "haveged-latest-${arch}.pkg.tar.xz" --noconfirm
 chroot "$mntDir" /usr/sbin/haveged -w 1024 -v 1
 chroot "$mntDir" pacman-key --init
 chroot "$mntDir" pacman-key --populate archlinux
-chroot "$mntDir" pkill haveged
+killall haveged
 
 # Update system
+chroot "$mntDir" mkdir -p /var/cache/{packer,pacman}/pkg
 chroot "$mntDir" pacman -Syy
-chroot "$mntDir" pacman -Su archiso linux linux-headers --noconfirm
+chroot "$mntDir" pacman -Su archiso device-mapper --needed --noconfirm
+chroot "$mntDir" pacman -S linux linux-headers --noconfirm
+cp "${mntDir}/etc/mkinitcpio.conf.livecd" "${mntDir}/etc/mkinitcpio.conf"
 chroot "$mntDir" mkinitcpio -p linux
 cp "${mntDir}/boot/vmlinuz-linux" "${tmpDir}/vmlinuz-linux"
 cp "${mntDir}/boot/initramfs-linux.img" "${tmpDir}/initramfs-linux.img"
 
-# Install additional packages
-chroot "$mntDir" pacman -S base base-devel --needed --noconfirm
+# Install dev packages
+#read -t 5 -n 1 -p "==> Install dev packages (Y/n): " input
+#echo "";
+#if [[ "$input" != [Nn] ]]; then
+#  chroot "$mntDir" pacman -S base base-devel --needed --noconfirm
+#fi
+chroot "$mntDir" pacman -S dhcpcd iproute2 --needed --noconfirm
+chroot "$mntDir" ln -s /usr/lib/systemd/system/dhcpcd.service /etc/systemd/system/multi-user.target.wants/dhcpcd.service
 
 # Prepare livecd
-cp etc/pacman.conf.stock etc/pacman.conf
-cp etc/mkinitcpio.conf.stock etc/mkinitcpio.conf
-rm "${mntDir}/etc/fstab" "${mntDir}/etc/mtab" 
+cp "${mntDir}/etc/pacman.conf.stock" "${mntDir}/etc/pacman.conf" 2>/dev/null
+cp "${mntDir}/etc/mkinitcpio.conf.stock" "${mntDir}/etc/mkinitcpio.conf" 2>/dev/null
+rm "${mntDir}/etc/fstab" "${mntDir}/etc/mtab" 2>/dev/null
+
+# Squash image
+echo "==> Exiting chroot"
+cd "$buildDir"
+umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
+umount "$mntDir/*/*" 2>/dev/null;
+umount "$mntDir/*" 2>/dev/null;
+sleep 1;
+sync
+#mksquashfs "$mntDir" "$sfsFile" -comp xz -noappend || EXIT_STATUS "mksquashfs failed"
+
+umount "$mntDir"
+
+mkdir -p "${buildDir}/squashfs-root"
+dd if="$virtPart" of="${buildDir}/squashfs-root/${ext4File}" || EXIT_STATUS "dd failed"
+
+mksquashfs "${buildDir}/squashfs-root" "$sfsFile" -comp xz -noappend || EXIT_STATUS "mksquashfs failed"
+
+# Create ISO
+cp -r "${tmpDir}/syslinux" "${buildDir}"
+cp "${tmpDir}/vmlinuz-linux" "${buildDir}/syslinux/arch/boot/i686/vmlinuz"
+cp "${tmpDir}/initramfs-linux.img" "${buildDir}/syslinux/arch/boot/i686/archiso.img"
+ln "${buildDir}/${sfsFile}" "${buildDir}/syslinux/arch/i686/"
+cd "${buildDir}/syslinux" 
+genisoimage -l -r -J -V "$label" -b isolinux/isolinux.bin -no-emul-boot -boot-load-size 4 -boot-info-table -c isolinux/boot.cat -o ../"$isoFile" . || EXIT_STATUS "genisoimage failed";
+isohybrid ../"$isoFile" || EXIT_STATUS "isohybrid failed"
 
 # Clean up
 CLEAN_UP
