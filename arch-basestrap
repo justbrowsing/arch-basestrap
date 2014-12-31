@@ -1,12 +1,12 @@
 #!/bin/bash
 ####################
 ### arch-basestrap #
-version="0.6" ######
+version="0.7" ######
 ### JustBrowsing ###
 ####################
 
-mirror="archlinux.supsec.org"
-release="2013.08.01"
+mirror="mirrors.dotsrc.org/archlinux"
+release="2013.10.01"
 arch="i686"
 
 label="arch-basestrap"
@@ -156,6 +156,9 @@ BASE_CONFIG()
   fi
 
   if [ ! -z "$locale" ]; then
+    #chroot "$mntDir" sed -i '/^LANG=/d' /etc/locale.gen
+    #line=$(grep -n "#$" "${mntDir}/etc/locale.gen" | tail -n 1 | awk -F : '{print $1}');
+    #sed -i "${line}iLANG=""\"${locale}\.UTF-8""\"" "${mntDir}/etc/locale.gen"
     sed -i "s/^#${locale}.UTF-8/${locale}.UTF-8/g" "${mntDir}/etc/locale.gen"
     chroot "$mntDir" locale-gen
   fi
@@ -168,6 +171,15 @@ ENTER_CHROOT()
   if [[ "$input" = [Yy] ]]; then
     chroot "$mntDir" /bin/bash;
   fi
+}
+
+JUST_CHROOT()
+{
+  chroot "$mntDir" /bin/bash;
+GO_ON_DIET --removeaur
+  CLOSE_CHROOT;
+  CLEAN_UP;
+  exit 0;
 }
 
 GENERATE_ENTROPY()
@@ -193,6 +205,11 @@ CORE_INSTALL()
   chroot "$mntDir" mkdir -p /var/cache/{packer,pacman}/pkg
   chroot "$mntDir" pacman -Syy
   chroot "$mntDir" pacman -Su device-mapper --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+
+  if [ ! -f "${mntDir}/boot/initramfs-linux.img" ]; then
+    echo "==> CORE INSTALL <=="
+    UPDATE_KERNEL
+  fi;
 }
 
 UPDATE_KERNEL()
@@ -219,6 +236,11 @@ CREATE_DIET()
   echo '[ ! -z "$1" ] && rm -rf !($1)' >> "$docdiet"
   echo '[ "$2" = "false" ] && rm -rf /usr/share/{man,man?}' >> "$docdiet"
   echo '[ "$2" = "false" ] && rm -rf /usr/share/doc' >> "$docdiet"
+  echo '[ "$2" = "false" ] && rm -rf /usr/share/gtk-doc' >> "$docdiet"
+  echo '[ "$2" = "false" ] && rm -f /usr/share/icons/*/icon-theme.cache' >> "$docdiet"
+  echo '[ "$2" = "false" ] && rm -rf /usr/share/icons/*/256x256' >> "$docdiet"
+  echo '[ "$2" = "false" ] && rm -rf /usr/share/icons/*/scalable' >> "$docdiet"
+  echo '[ "$3" = "apacman" ] && pacman -Rss apacman --noconfirm' >> "$docdiet"
   echo 'shopt -u extglob' >> "$docdiet"
   chmod +x "$docdiet"
 }
@@ -229,6 +251,11 @@ GO_ON_DIET()
   echo -en "\033[1m:::::> Go on a diet ... "
   before=$(df 2>/dev/null | grep "^$virtPart" | awk '{print $4}');
   chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages";
+  if [ -z "$1" ]; then
+    chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages";
+  elif [ "$1" = "--removeaur" ]; then
+    chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages" "apacman";
+  fi
   after=$(df 2>/dev/null | grep "^$virtPart" | awk '{print $4}');
   echo -e "lost $((((after-before)*1024)/10**6)) MB\033[0m"
   
@@ -255,37 +282,19 @@ ENABLE_ETHERNET()
 ENABLE_AUR()
 {
   # Install dependencies
-  packerDepends="binutils file wget ca-certificates jshon git pcre"
-  compileDepends="make gcc autoconf automake gettext patch pkg-config tar"
+  packerDepends="binutils file wget ca-certificates jshon git pcre grep unzip"
+  compileDepends="make gcc autoconf automake gettext patch pkg-config which tar"
   chroot "$mntDir" pacman -S $packerDepends $compileDepends --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
 
-  packer="/usr/bin/packer"
   apacman="/usr/bin/apacman"
   if [ ! -f "${mntDir}/$apacman" ]; then
-    # Install packer
-    echo -e "\033[1m:::::> Installing packer\033[0m"
-    chroot "$mntDir" mkdir -p "/opt/aur/packer"
-    chroot "$mntDir" wget "https://aur.archlinux.org/packages/pa/packer/PKGBUILD" -O "/opt/aur/packer/PKGBUILD"
-    chroot "$mntDir" su -c 'cd /opt/aur/packer && makepkg --asroot --noconfirm -i --needed'
-    aurTest=$(chroot "$mntDir" packer -Ss justbrowsing-webapps 2>/dev/null);
+    # Install apacman
+    echo -e "\033[1m:::::> Installing apacman\033[0m"
+    chroot "$mntDir" mkdir -p "/opt/aur/apacman"
+    chroot "$mntDir" wget "https://aur.archlinux.org/packages/ap/apacman/PKGBUILD" -O "/opt/aur/apacman/PKGBUILD"
+    chroot "$mntDir" su -c 'cd /opt/aur/apacman && makepkg --asroot --noconfirm -i --needed'
+    aurTest=$(chroot "$mntDir" apacman -Ss justbrowsing-webapps 2>/dev/null);
     [ -z "$aurTest" ] && EXIT_STATUS "Cannot search AUR"
-
-    # Patch packer
-    echo -e "\033[1m:::::> Patching packer as apacman\033[0m"
-    chroot "$mntDir" cp "$packer" "$apacman"
-    chroot "$mntDir" mkdir -p "/var/cache/apacman/pkg"
-    line=$(grep -n "pacmanconf=" "${mntDir}/$apacman" | awk -F ":" '{print $1}');
-    chroot "$mntDir" sed -i "${line}asaveDir='/var/cache/packer/pkg'" $apacman; 
-    line=$(grep -n "The build failed" "${mntDir}/$apacman" | awk -F ":" '{print $1}');
-    chroot "$mntDir" sed -i "${line}a%%%" $apacman; line=$((line+1));
-    chroot "$mntDir" sed -i "${line}a%%%  if [ ! -d \$saveDir ]; then" $apacman; line=$((line+1));
-    chroot "$mntDir" sed -i "${line}a%%%    runasroot mkdir -p \$saveDir" $apacman; line=$((line+1));
-    chroot "$mntDir" sed -i "${line}a%%%  fi" $apacman; line=$((line+1));
-    chroot "$mntDir" sed -i "${line}a%%%  runasroot cp \$pkgname-*\$PKGEXT \$saveDir/" $apacman; line=$((line+1));
-    chroot "$mntDir" sed -i "${line}a%%%  echo ""\"Saved: \$(ls \$pkgname-*\$PKGEXT)""\";" $apacman; line=$((line+1));
-    chroot "$mntDir" sed -i "${line}a%%%" $apacman;
-    chroot "$mntDir" sed -i 's/^%%%//g' $apacman;
-    chroot "$mntDir" sed -i 's/makepkg $MAKEPKGOPTS/makepkg -A $MAKEPKGOPTS/g' $apacman;
   fi;
 }
 
@@ -312,6 +321,7 @@ COMPIZ_INSTALL()
   compizMain="compiz-bcop compizconfig-python libcompizconfig"
   compizAddons="compiz-fusion-plugins-main compiz-fusion-plugins-extra emerald emerald-themes"
   compizConfig="ccsm fusion-icon-fixed python2-sexy"
+  echo -e "\033[1m:::::> Installing Compiz recipe\033[0m"
   chroot "$mntDir" pacman -S $xorgDeps $compizDeps --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
 ENTER_CHROOT
   chroot "$mntDir" pacman -U /var/cache/pacman/pkg/compiz-core-0.8.8-5-i686.pkg.tar.xz --noconfirm
@@ -330,12 +340,29 @@ JB_INSTALL()
   themeDeps="ttf-droid clearlooks-phenix-gtk-theme justbrowsing-theme"
   firefoxDeps="firefox justbrowsing-firefox-profile flashplugin"
   chromeDeps="google-chrome-dev justbrowsing-chrome-profile"
-  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $vmDrivers $desktopDeps $desktopAddons $themeDeps --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $firefoxDeps $chromeDeps --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  echo -e "\033[1m:::::> Installing JustBrowsing recipe\033[0m"
+  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" apacman -S $vmDrivers $desktopDeps $desktopAddons $themeDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" apacman -S $firefoxDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
   echo 'include "/usr/share/themes/Clearlooks-Phenix/gtk-2.0/gtkrc"' > "${mntDir}/usr/share/justbrowsing/.gtkrc-2.0"
   echo 'gtk-theme-name="clearlooks-phenix"' >> "${mntDir}/usr/share/justbrowsing/.gtkrc-2.0"
   echo 'gtk-icon-theme-name="gnome-brave"' >> "${mntDir}/usr/share/justbrowsing/.gtkrc-2.0"
+}
+
+MAXIMA_INSTALL()
+{
+  # Install Maxima with wXWidgets
+  xorgDeps="xorg-server xorg-xinit xf86-input-evdev xf86-input-synaptics xf86-input-keyboard xf86-input-mouse mesa-libgl"
+  videoDrivers="xf86-video-fbdev xf86-video-vesa xf86-video-intel xf86-video-nouveau ati-dri"
+  vmDrivers="xf86-video-qxl xf86-video-vmware xf86-input-vmmouse"
+  maximaDeps="maxima wxmaxima"
+  desktopDeps="i3-wm nano xterm" #create user
+  themeDeps="ttf-droid clearlooks-phenix-gtk-theme"
+  echo -e "\033[1m:::::> Installing Maxima with wXWidgets recipe\033[0m"
+  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" pacman -S $maximaDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" apacman -S $desktopDeps $themeDeps $vmDrivers --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" sed -i 's/^ShowTips=.*/ShowTips=0/g' "/home/user/.wxMaxima"
 }
 
 CLOSE_CHROOT()
@@ -377,7 +404,7 @@ INSTALL_BASE
 FIX_PACMAN
 CREATE_CHROOT
 BASE_CONFIG
-ENTER_CHROOT
+[[ $@ = *--chroot* ]] && JUST_CHROOT
 GENERATE_ENTROPY
 CORE_INSTALL
 [[ $@ = *--kernel* ]] && UPDATE_KERNEL
@@ -389,8 +416,10 @@ ENABLE_AUR
 BOOT_INSTALL
 [[ $@ = *--compiz* ]] && COMPIZ_INSTALL
 [[ $@ = *--justbrowsing* ]] && JB_INSTALL
+[[ $@ = *--maxima* ]] && MAXIMA_INSTALL
 ENTER_CHROOT
 GO_ON_DIET
+GO_ON_DIET --removeaur
 CLOSE_CHROOT
 
 CLEAN_UP
