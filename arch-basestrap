@@ -1,55 +1,74 @@
 #!/bin/bash
 ####################
 ### arch-basestrap #
-version="0.9" ######
+version="1.0" ######
 ### JustBrowsing ###
 ####################
 
-mirror="mirrors.dotsrc.org/archlinux"
-release="2013.10.01"
 arch="i686"
+release="2014.12.01"
+mirror="mirrors.dotsrc.org/archlinux"
+bootstrap="http://${mirror}/iso/${release}/archlinux-bootstrap-${release}-${arch}.tar.gz";
 
 label="arch-basestrap"
-imgSize="1600"
+imgSize="2000"
+startPos="2048"
 locale="en_US"
 manpages="false"
 
-tmpDir="/opt/arch-tmp"
-buildDir="/opt/arch-build"
-mntDir="/opt/arch-iso"
+tmpDir="/opt/just-tmp"
+buildDir="/opt/just-build"
+mntDir="/opt/just-iso"
 
-imgFile="qemu.qcow2"
-#imgFile="archbase.img"
+imgFile="archbase.img"
 ext4File="root-image.fs"
 sfsFile="root-image.fs.sfs"
 isoFile="arch-basestrap.iso"
 
-
-bootstrap="http://${mirror}/iso/${release}/archlinux-bootstrap-${release}-${arch}.tar.gz";
+# Colors
+RESET="\e[0;0m"
+FAIL="\e[1;31m"
+WARN="\e[1;33m"
+BOLD="\e[1;34m"
+NOTE="\e[1;35m"
+HINT="\e[1;36m"
+S0="${HINT}(*)"
 
 EXIT_STATUS() { echo -e "\033[1m:::::> ERROR: $@\033[0m"; CLEAN_UP; exit 1; }
 
 CLEAN_UP()
 {
-  echo -e "\033[1m:::::> Cleaning up\033[0m";
+  echo -e "\033[1m:::::> Cleaning up\033[0m"
   sync
   sleep 1
   sync
-echo "debug 1"
-  umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null;
-  umount "$mntDir/*/*" 2>/dev/null;
-  umount "$mntDir/*" 2>/dev/null;
-  umount "$mntDir" 2>/dev/null;
-echo "debug 2"
-  qemu-nbd -d "$virtPart"
-echo "debug 3"
-  losetup -d "$virtDrive";
-echo "debug 4"
-  rm -rf "$mntDir"
+  pkill -f gpg
+  cd /
+  umount --recursive "${mntDir}"
+  umount "${mntDir}/var/cache" "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null
+  umount "$mntDir/*/*" 2>/dev/null
+  umount "$mntDir/*" 2>/dev/null
+  umount "$mntDir" 2>/dev/null
+  losetup -d "$virtDrive" 2>/dev/null
+  losetup -D
   rm -rf "${buildDir}/syslinux"
-echo "debug 5"
   mount -o remount,gid=5,mode=620 /dev/pts
   sync
+}
+
+MENU() {
+  echo ""
+  echo -e "${NOTE}==== arch-basestrap ====${RESET}"
+  echo -e "${HINT}1.) Download bootstrap ${S1}${RESET}"
+  echo -e "${BOLD}2.) Create disk image ${S2}${RESET}"
+  echo -e "${HINT}3.) Format image ${S3}${RESET}"
+  echo -e "${BOLD}4.) Unpack bootstrap ${S4}${RESET}"
+  echo -e "${HINT}5.) Mount basestrap ${S5}${RESET}"
+  echo -e "${BOLD}6.) Base config ${S6}${RESET}"
+  echo -e "${HINT}7.) Install base packages ${S7}${RESET}"
+  echo -e "${BOLD}8.) Enter chroot ${S8}${RESET}"
+  echo -e "${HINT}9.) Boot nspawn container ${S9}${RESET}"
+  echo -e "${BOLD}0.) Quit${RESET}"
 }
 
 DOWNLOAD_BOOTSTRAP()
@@ -61,57 +80,53 @@ DOWNLOAD_BOOTSTRAP()
     wget "$bootstrap" -O "archlinux-bootstrap-${release}-${arch}.tar.gz";
   fi
   [ -f "archlinux-bootstrap-${release}-${arch}.tar.gz" ] || EXIT_STATUS "Download failed";
-}
-
-QCOW_IMAGE()
-{
-  # Create qcow2 image
-  cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
-  echo -e "\033[1m:::::> Creating qcow2 image\033[0m"
-  virtPart="/dev/nbd0"
-  if [ ! -f "$imgFile" ]; then
-    qemu-img create -f qcow2 "$imgFile" "${imgSize}M"
-    chmod 777 "$imgFile"
-  fi
-  
-  modprobe nbd max_part=16
-  [ -b "$virtPart" ] || EXIT_STATUS "nbd error"
-  qemu-nbd -c "$virtPart" "$imgFile"
-  
-  [ -f "$imgFile" ] || EXIT_STATUS "qcow2 image creation failed"
-  imageType=$(file "$imgFile" | awk -F ": " '{print $2}'| awk -F "," '{print $1}');
-  [ "$imageType" = "QEMU QCOW Image (v2)" ] || EXIT_STATUS "Invalid file format";
+  S1="$S0"
 }
 
 RAW_IMAGE()
 {
+  # Image overwrite check
+  if [ -f "${buildDir}/$imgFile" ]; then
+    read -t 5 -n 1 -p ":::::> Overwrite image (y/N): " input
+    echo "";
+    [[ "$input" = [Yy] ]] && rm "${buildDir}/$imgFile"
+  fi
+
   # Create raw image
   cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
   echo -e "\033[1m:::::> Creating raw image\033[0m"
   if [ ! -f "$imgFile" ]; then
-    dd if=/dev/zero of="$imgFile" bs=1MB count="$imgSize" &&
+    fallocate -l "${imgSize}M" -o "$startPos" "$imgFile" &&
     chmod 777 "$imgFile"
     parted -s -a optimal "$imgFile"
     parted -s "$imgFile" mklabel msdos
   fi
   [ -f "$imgFile" ] || EXIT_STATUS "Raw image creation failed"
   imageType=$(file "$imgFile" | awk -F ": " '{print $2}');
-  [ "$imageType" = "x86 boot sector" ] || EXIT_STATUS "Invalid partition table";
+  [ "$imageType" = "x86 boot sector" -o "DOS/MBR boot sector" ] || EXIT_STATUS "Invalid partition table";
+  S2="$S0"
+}
+
+LOOP_IMAGE()
+{
+  echo -e "\033[1m:::::> Mounting image\033[0m"
+  cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
+  resetLoop=$(losetup -f 2>&1  | grep -o "unused loop device");
+  [ "$resetLoop" = "unused loop device" ] && modprobe -r loop && modprobe loop
+  losetup -f "$imgFile" || EXIT_STATUS "Unable to mount virtDrive"
+  virtDrive=$(losetup -a 2>&1 | grep "${buildDir}/${imgFile}" | awk -F ":" '{print $1}');
+  [ -b "$virtDrive" ] || EXIT_STATUS "loopback failed"
+  fdisk -l "$virtDrive" || EXIT_STATUS "Invalid virtDrive"
+  virtPart=$(fdisk -l "$virtDrive" 2>&1 | grep "^/" | tail -n 1 | awk '{print $1}');
 }
 
 PART_IMAGE()
 {
   # Partition image
   echo -e "\033[1m:::::> Creating partition\033[0m"
-  cd "$buildDir" || EXIT_STATUS "Couldn't cd into $buildDir"
-  losetup -f "$imgFile" || EXIT_STATUS "Unable to mount virtDrive"
-  virtDrive=$(losetup -a 2>&1 | grep "${buildDir}/${imgFile}" | awk -F ":" '{print $1}');
-  [ -b "$virtDrive" ] || EXIT_STATUS "loopback failed"
-  fdisk -l "$virtDrive" || EXIT_STATUS "Invalid virtDrive"
-  virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
   if [ ! -b "$virtPart" ]; then
     parted -s "$virtDrive" mkpart primary 1 "$imgSize"
-    virtPart=$(fdisk -l "$virtDrive" 2>&1 | tail -n 1 | awk '{print $1}');
+    virtPart=$(fdisk -l "$virtDrive" 2>&1 | grep "^/" | tail -n 1 | awk '{print $1}');
   fi
   [ -b "$virtPart" ] || EXIT_STATUS "Failed to create partition"
 }
@@ -127,9 +142,10 @@ FORMAT_IMAGE()
     virtFS=$(fsck -N "$virtPart" 2>&1 | awk -F " fsck." '{print $2}' | awk '{print $1}' | grep -v ^$);
   fi
   [ "$virtFS" = "ext4" ] || EXIT_STATUS "Filesystem check failed. Not ext4"
+  S3="$S0"
 }
 
-INSTALL_BASE()
+UNPACK_BOOTSTRAP()
 {
   # Uncompress
   echo -e "\033[1m:::::> Mounting partition\033[0m"
@@ -149,31 +165,60 @@ FIX_PACMAN()
   echo "nameserver 8.8.8.8" > "${mntDir}/etc/resolv.conf"
   [ -f "etc/pacman.conf.stock" ] || cp "${mntDir}/etc/pacman.conf" "${mntDir}/etc/pacman.conf.stock" 2>/dev/null
   sed -i 's/^Architecture =.*/Architecture = i686/g' "${mntDir}/etc/pacman.conf"
-  #sed -i 's/^CheckSpace/#CheckSpace/g' "${mntDir}/etc/pacman.conf"
+  sed -i 's/^CheckSpace/#CheckSpace/g' "${mntDir}/etc/pacman.conf"
   sed -i 's/^#Color/Color/g' "${mntDir}/etc/pacman.conf"
+  S4="$S0"
+}
+
+MOUNT_IMAGE()
+{
+  # Check mounted
+#  imgLoop=$(losetup -l 2>&1 | grep -o "${buildDir}/${imgFile}")
+#  [ -z "$imgLoop" ] && LOOP_IMAGE
+
+#  imgRoot=$(df -h 2>/dev/null | grep -o "$mntDir")
+#  [ -z "$imgRoot" ] && mount "$virtPart" "$mntDir"
+
+  offset=$((startPos*512))
+  imgRoot=$(df -h 2>/dev/null | grep -o "$mntDir")
+  if [ -z "$imgRoot" ]; then
+    imgLoop=$(losetup -l 2>&1 | grep -o "${buildDir}/${imgFile}")
+    [ -z "$imgLoop" ] || losetup -d "$virtDrive"
+    modprobe -r loop && modprobe loop
+    mount -o loop,offset=$offset "${buildDir}/${imgFile}" "$mntDir" || EXIT_STATUS "Unable to mount image"
+    echo "==> mounted"
+  else
+    echo "==> already mounted"
+  fi
 }
 
 CREATE_CHROOT()
 {
   # Enter chroot
-  cd "$buildDir"
-  echo -e "\033[1m:::::> Mounting chroot: ${mntDir}\033[0m"
-  mount -t proc proc "${mntDir}/proc/"
-  mount -t sysfs sys "${mntDir}/sys/"
-  mount -o bind /dev "${mntDir}/dev/"
-  mount -t devpts pts "${mntDir}/dev/pts"
+  echo -e "\033[1m:::::> Mounting chroot: ${mntDir}\033[0m" &&
+#  mount -t proc proc -o nosuid,noexec,nodev "${mntDir}/proc/" &&
+#  mount -t sysfs sys -o nosuid,noexec,nodev,ro "${mntDir}/sys/" &&
+#  mount -t devtmpfs udev -o mode=0755,nosuid "${mntDir}/dev/" &&
+#  mount -t devpts pts -o mode=0620,gid=5,nosuid,noexec "${mntDir}/dev/pts"
+
+  mount --make-private -t proc proc "${mntDir}/proc/" &&
+  mount --make-private -t sysfs sys "${mntDir}/sys/" &&
+  mount --make-private -t devtmpfs udev "${mntDir}/dev/" &&
+  mount --make-private -t devpts pts "${mntDir}/dev/pts"
 
   mkdir -p "${tmpDir}/var-cache" "${tmpDir}/tmp-dir"
+  mkdir -p "${mntDir}/var/cache" "${mntDir}/tmp"
   mount -o bind,exec,rw "${tmpDir}/var-cache" "${mntDir}/var/cache"
   mount -o bind,exec,rw "${tmpDir}/tmp-dir" "${mntDir}/tmp"
   mkdir -p "${mntDir}/var/cache/pacman/pkg"
   mkdir -p "${mntDir}/var/cache/apacman/pkg"
-  mount -o remount,gid=5,mode=620 /dev/pts
+  mount -o remount,gid=5,mode=620 /dev/pts &&
+  S5="$S0"
 }
 
 BASE_CONFIG()
 {
-  # Set some basics
+  echo -e "\033[1m:::::> Set some basics\033[0m"
   echo "${virtPart} / ext4 rw,relatime,data=ordered 0 1" > "${mntDir}/etc/fstab"
   echo "$label" > "${mntDir}/etc/hostname"
 
@@ -183,9 +228,6 @@ BASE_CONFIG()
   fi
 
   if [ ! -z "$locale" ]; then
-    #chroot "$mntDir" sed -i '/^LANG=/d' /etc/locale.gen
-    #line=$(grep -n "#$" "${mntDir}/etc/locale.gen" | tail -n 1 | awk -F : '{print $1}');
-    #sed -i "${line}iLANG=""\"${locale}\.UTF-8""\"" "${mntDir}/etc/locale.gen"
     sed -i "s/^#${locale}.UTF-8/${locale}.UTF-8/g" "${mntDir}/etc/locale.gen"
     chroot "$mntDir" locale-gen
   fi
@@ -193,50 +235,46 @@ BASE_CONFIG()
 
 ENTER_CHROOT()
 {
-  read -t 5 -n 1 -p ":::::> Enter chroot (y/N): " input
-  echo "";
-  if [[ "$input" = [Yy] ]]; then
-    chroot "$mntDir" /bin/bash;
-  fi
+  imgRoot=$(df -h 2>/dev/null | grep -o "$mntDir")
+  [ -z "$imgRoot" ] && MOUNT_IMAGE && CREATE_CHROOT
+  chroot "$mntDir" /bin/bash
 }
 
-JUST_CHROOT()
+NSPAWN_BOOT()
 {
-  chroot "$mntDir" /bin/bash;
-#GO_ON_DIET --removeaur
-  CLOSE_CHROOT;
-  CLEAN_UP;
-  exit 0;
+  imgRoot=$(df -h 2>/dev/null | grep -o "$mntDir")
+  [ -z "$imgRoot" ] && MOUNT_IMAGE &&
+  systemd-nspawn -b -D "$mntDir" ||
+  systemd-nspawn -D "$mntDir"
 }
 
 GENERATE_ENTROPY()
 {
-  # Prepare keyring
+  echo -e "\033[1m:::::> Prepare keyring\033[0m"
   if [ ! -f "${mntDir}/etc/.entropy" ]; then
     [ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz" ] ||
     wget "https://www.archlinux.org/packages/extra/${arch}/haveged/download/" -O "${mntDir}/haveged-latest-${arch}.pkg.tar.xz"
     [ -f "${mntDir}/haveged-latest-${arch}.pkg.tar.xz" ] || EXIT_STATUS "Unable to download haveged package"
     chroot "$mntDir" pacman -U "haveged-latest-${arch}.pkg.tar.xz" --noconfirm
     echo -e "\033[1m:::::> Generating entropy\033[0m"
-    chroot "$mntDir" /usr/sbin/haveged -w 1024 -v 1
+    chroot "$mntDir" /usr/bin/haveged -w 1024 -v 1
+    chroot "$mntDir" rm -rf /etc/pacman.d/gnupg
+    chroot "$mntDir" pacman -Syy
     chroot "$mntDir" pacman-key --init
     chroot "$mntDir" pacman-key --populate archlinux
     killall haveged
     chroot "$mntDir" touch "/etc/.entropy"
   fi
+  S6="$S0"
 }
 
 CORE_INSTALL()
 {
   # Update system
-  chroot "$mntDir" mkdir -p /var/cache/{packer,pacman}/pkg
+  chroot "$mntDir" mkdir -p /var/cache/{apacman,pacman}/pkg
   chroot "$mntDir" pacman -Syy
-  chroot "$mntDir" pacman -Su device-mapper --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-
-  if [ ! -f "${mntDir}/boot/initramfs-linux.img" ]; then
-    echo "==> CORE INSTALL <=="
-    UPDATE_KERNEL
-  fi;
+  chroot "$mntDir" pacman -Su device-mapper grep psmisc procps-ng --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
+  chroot "$mntDir" pacman-db-upgrade
 }
 
 UPDATE_KERNEL()
@@ -252,195 +290,26 @@ UPDATE_KERNEL()
   chroot "$mntDir" mkinitcpio -p linux
   cp "${mntDir}/boot/vmlinuz-linux" "${tmpDir}/vmlinuz-linux"
   cp "${mntDir}/boot/initramfs-linux.img" "${tmpDir}/initramfs-linux.img"
+  S7="$S0"
 }
 
-DEFAULT_USER()
-{
-  userName="user"
-  userDir="/home"
-  [ ! -z "$1" ] && userName="$1"
-  [ ! -z "$2" ] && userDir="$2"
-  chroot "$mntDir" mkdir -p "${userDir}"
-  [ -d "${mntDir}${userDir}" ] && userDir="${userDir}/${userName}"
-  chroot "$mntDir" useradd -U -m -d "${userDir}" "${userName}"
-  chroot "$mntDir" chown -R ${userName}:${userName} "${userDir}"
-
-}
-
-CREATE_DIET()
-{
-  docdiet="${mntDir}/opt/docdiet"
-  echo '#!/bin/bash' > "$docdiet"
-  echo 'shopt -s extglob' >> "$docdiet"
-  echo 'cd /usr/share/locale' >> "$docdiet"
-  echo '[ ! -z "$1" ] && rm -rf !($1)' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -rf /usr/share/{man,man?}' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -rf /usr/share/doc' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -rf /usr/share/gtk-doc' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -f /usr/share/icons/*/icon-theme.cache' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -rf /usr/share/icons/*/256x256' >> "$docdiet"
-  echo '[ "$2" = "false" ] && rm -rf /usr/share/icons/*/scalable' >> "$docdiet"
-  echo '[ "$3" = "apacman" ] && pacman -Rs apacman-deps --noconfirm' >> "$docdiet"
-  echo 'shopt -u extglob' >> "$docdiet"
-  chmod +x "$docdiet"
-}
-
-GO_ON_DIET()
-{
-  # Go on a diet
-  echo -en "\033[1m:::::> Go on a diet ... "
-  before=$(df 2>/dev/null | grep "^$virtPart" | awk '{print $4}');
-  chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages";
-  if [ -z "$1" ]; then
-    chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages";
-  elif [ "$1" = "--removeaur" ]; then
-    chroot "$mntDir" "/opt/docdiet" "$locale" "$manpages" "apacman";
-  fi
-  after=$(df 2>/dev/null | grep "^$virtPart" | awk '{print $4}');
-  echo -e "lost $((((after-before)*1024)/10**6)) MB\033[0m"
-  
-}
-
-DEV_INSTALL()
-{
-  # Install dev packages
-  read -t 5 -n 1 -p ":::::> Install dev packages (Y/n): " input
-  echo "";
-  if [[ "$input" != [Nn] ]]; then
-    chroot "$mntDir" pacman -S base base-devel --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  fi
-}
-
-ENABLE_ETHERNET()
-{
-  # Enable networking
-  chroot "$mntDir" pacman -S dhcpcd iproute2 --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" ln -s /usr/lib/systemd/system/dhcpcd.service /etc/systemd/system/multi-user.target.wants/dhcpcd.service 2>/dev/null
-}
-
-
-ENABLE_AUR()
-{
-  # Install dependencies
-#  packerDepends="binutils file wget ca-certificates jshon git pcre grep unzip"
-#  compileDepends="make gcc autoconf automake gettext patch pkg-config which tar"
-#  chroot "$mntDir" pacman -S $packerDepends $compileDepends --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-
-  packerDepends="binutils ca-certificates file jshon tar wget which unzip"
-
-  apacman="/usr/bin/apacman"
-  if [ ! -f "${mntDir}/$apacman" ]; then
-    # Install apacman
-    echo -e "\033[1m:::::> Installing apacman\033[0m"
-    chroot "$mntDir" pacman -S $packerDepends --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-    chroot "$mntDir" mkdir -p "/opt/aur"
-    chroot "$mntDir" wget "https://aur.archlinux.org/packages/ap/apacman/apacman.tar.gz" -O "/opt/aur/apacman.tar.gz"
-    chroot "$mntDir" tar -C "/opt/aur" -xf "/opt/aur/apacman.tar.gz"
-    chroot "$mntDir" su -c 'cd /opt/aur/apacman && makepkg --asroot --noconfirm -i --needed'
-    aurTest=$(chroot "$mntDir" apacman -Ss justbrowsing-webapps 2>/dev/null);
-    [ -z "$aurTest" ] && EXIT_STATUS "Cannot search AUR"
-  fi;
-
-  echo -e "\033[1m:::::> Installing apacman-deps\033[0m"
-  chroot "$mntDir" apacman -S apacman-deps --needed --noconfirm
-}
-
-BOOT_INSTALL()
-{
-  # Install syslinux bootloader
-  echo -e "\033[1m:::::> Installing bootloader\033[0m"
-  chroot "$mntDir" pacman -S syslinux --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" syslinux-install_update -i -a -m
-  chroot "$mntDir" sed -i 's/ root=.*/ root=\/dev\/sda1 rw init=\/usr\/lib\/systemd\/systemd/g' "/boot/syslinux/syslinux.cfg"
-  lineStart=$(grep -n "LABEL archfallback" "${mntDir}/boot/syslinux/syslinux.cfg" | awk -F : '{print $1}');
-  if [[ "$lineStart" = [0-9]* ]]; then
-    lineEnd=$((lineStart+4));
-    chroot "$mntDir" sed -i "${lineStart},${lineEnd}d" "/boot/syslinux/syslinux.cfg"
-  fi;
-}
-
-COMPIZ_INSTALL()
-{
-  # Install Compiz WM
-  xorgDeps="xorg-server xorg-xinit xf86-video-fbdev xf86-video-vesa xf86-input-keyboard xf86-input-mouse mesa-libgl"
-  compizDeps="startup-notification librsvg glu libxslt fuse phonon-gstreamer ttf-liberation"
-#compiz compizconfig-backend-gconf
-  compizMain="compiz-bcop compizconfig-python libcompizconfig"
-  compizAddons="compiz-fusion-plugins-main compiz-fusion-plugins-extra emerald emerald-themes"
-  compizConfig="ccsm fusion-icon-fixed python2-sexy"
-  echo -e "\033[1m:::::> Installing Compiz recipe\033[0m"
-  chroot "$mntDir" pacman -S $xorgDeps $compizDeps --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-ENTER_CHROOT
-  chroot "$mntDir" pacman -U /var/cache/pacman/pkg/compiz-core-0.8.8-5-i686.pkg.tar.xz --noconfirm
-  chroot "$mntDir" apacman -S $compizMain $compizAddons $compizConfig --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" pacman -U /var/cache/pacman/pkg/compizconfig-backend-gconf-0.8.8-2-i686.pkg.tar.xz --noconfirm
-}
-
-JB_INSTALL()
-{
-  # Install JustBrowsing DE
-  xorgDeps="xorg-server xorg-xinit xf86-input-evdev xf86-input-synaptics xf86-input-keyboard xf86-input-mouse mesa-libgl"
-  videoDrivers="xf86-video-fbdev xf86-video-vesa xf86-video-intel xf86-video-nouveau ati-dri"
-  vmDrivers="xf86-video-qxl xf86-video-vmware xf86-input-vmmouse"
-  desktopDeps="i3-wm nitrogen wbar justbrowsing-home justbrowsing-adeskbar"
-  desktopAddons="justbrowsing-xorg i3lock-spy pnmixer network-manager-applet-gtk2 justbrowsing-webapps"
-  themeDeps="ttf-droid clearlooks-phenix-gtk-theme justbrowsing-theme"
-  firefoxDeps="firefox justbrowsing-firefox-profile flashplugin"
-  chromeDeps="google-chrome-dev justbrowsing-chrome-profile"
-  echo -e "\033[1m:::::> Installing JustBrowsing recipe\033[0m"
-  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $vmDrivers $desktopDeps $desktopAddons $themeDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $firefoxDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  echo 'include "/usr/share/themes/Clearlooks-Phenix/gtk-2.0/gtkrc"' > "${mntDir}/usr/share/justbrowsing/.gtkrc-2.0"
-  echo 'gtk-theme-name="clearlooks-phenix"' >> "${mntDir}/usr/share/justbrowsing/.gtkrc-2.0"
-  echo 'gtk-icon-theme-name="gnome-brave"' >> "${mntDir}/usr/share/justbrowsing/.gtkrc-2.0"
-}
-
-MAXIMA_INSTALL()
-{
-  # Install Maxima with wXWidgets
-  xorgDeps="xorg-server xorg-xinit xf86-input-evdev xf86-input-synaptics xf86-input-keyboard xf86-input-mouse mesa-libgl"
-  videoDrivers="xf86-video-fbdev xf86-video-vesa xf86-video-intel xf86-video-nouveau ati-dri"
-  vmDrivers="xf86-video-qxl xf86-video-vmware xf86-input-vmmouse"
-  maximaDeps="maxima wxmaxima"
-  desktopDeps="i3-wm nano xterm" #create user
-  themeDeps="ttf-droid clearlooks-phenix-gtk-theme"
-  echo -e "\033[1m:::::> Installing Maxima with wXWidgets recipe\033[0m"
-  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" pacman -S $maximaDeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $desktopDeps $themeDeps $vmDrivers --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" sed -i 's/^ShowTips=.*/ShowTips=0/g' "/home/user/.wxMaxima"
-}
-
-FOSSGAMES_INSTALL()
-{
-  # Install FOSS games
-  xorgDeps="xorg-server xorg-xinit xf86-input-evdev xf86-input-synaptics xf86-input-keyboard xf86-input-mouse mesa-libgl"
-  videoDrivers="xf86-video-fbdev xf86-video-vesa xf86-video-intel xf86-video-nouveau ati-dri"
-  vmDrivers="xf86-video-qxl xf86-video-vmware xf86-input-vmmouse"
-  desktopDeps="i3-wm python2-imaging adeskbar"
-  binGames="extremetuxracer frozen-bubble gbrainy hex-a-hop paintown mari0 neverball supertux supertuxkart tuxpuck"
-  srcGames="anagramarama burgerspace enigma_sdl gltron greed magicor meandmyshadow methane numptyphysics-svn xpenguins"
-  moreGames="aisleriot deckcards slysics touchmegames lynsol"
-  echo -e "\033[1m:::::> Installing FOSS games recipe\033[0m"
-  chroot "$mntDir" pacman -S $xorgDeps $videoDrivers --asdeps --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $desktopDeps $binGames --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-  chroot "$mntDir" apacman -S $vmDrivers $srcGames --needed --noconfirm 3>&1 1>&2 2>&3 | grep -v "is up to date -- skipping"
-}
-
-CLOSE_CHROOT()
+CLOSE_IMAGE()
 {
   echo -e "\033[1m:::::> Exiting chroot\033[0m"
   cd "$buildDir"
   sync
+  pkill -f gpg
+  cd /
   sleep 1
   sync
-  umount "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null
+  umount --recursive "${mntDir}"
+  umount "${mntDir}/var/cache" "${mntDir}/var/cache" "${mntDir}/tmp" "${mntDir}/proc/" "${mntDir}/sys/" "${mntDir}/dev/pts" "${mntDir}/dev/" 2>/dev/null
   umount "$mntDir/*/*" 2>/dev/null
   umount "$mntDir/*" 2>/dev/null
   sleep 1
   sync
-  umount "$mntDir"
+  umount "$mntDir" 2>/dev/null
+  S8="$S0"
 }
 
 ###########################
@@ -451,46 +320,36 @@ echo -e "\033[1m:::::> Running arch-basestrap\033[0m"
 mkdir -p "$tmpDir" "$buildDir" "$mntDir"
 trap CLEAN_UP INT;
 
-# Image overwrite check
-if [ -f "${buildDir}/$imgFile" ]; then
-  read -t 5 -n 1 -p ":::::> Overwrite image (y/N): " input
-  echo "";
-  [[ "$input" = [Yy] ]] && rm "${buildDir}/$imgFile"
-fi
+# Checks
+[ -f "${tmpDir}/archlinux-bootstrap-${release}-${arch}.tar.gz" ] && S1="$S0"
+[ -f "${buildDir}/$imgFile" ] && S2="$S0"
 
-
-DOWNLOAD_BOOTSTRAP
-#RAW_IMAGE
-QCOW_IMAGE
-#PART_IMAGE
-FORMAT_IMAGE
-INSTALL_BASE
-FIX_PACMAN
-CREATE_CHROOT
-BASE_CONFIG
-[[ $@ = *--chroot* ]] && JUST_CHROOT
-GENERATE_ENTROPY
-CORE_INSTALL
-  #JUST_CHROOT
-
-[[ $@ = *--kernel* ]] && UPDATE_KERNEL
-CREATE_DIET
-GO_ON_DIET
-[[ $@ = *--dev* ]] && DEV_INSTALL
-ENABLE_ETHERNET
-ENABLE_AUR
-BOOT_INSTALL
-[[ $@ = *--compiz* ]] && COMPIZ_INSTALL
-[[ $@ = *--justbrowsing* ]] && JB_INSTALL
-[[ $@ = *--maxima* ]] && MAXIMA_INSTALL
-[[ $@ = *--games* ]] && FOSSGAMES_INSTALL
-ENTER_CHROOT
-GO_ON_DIET
-#GO_ON_DIET --removeaur
-CLOSE_CHROOT
+# Prompt user
+while [ "$input" != "0" ]; do
+  MENU
+  read -n 1 -p "Select an option [0-9]: " input
+  echo ""
+  if [ "$input" = "1" ]; then
+    DOWNLOAD_BOOTSTRAP
+  elif [ "$input" = "2" ]; then
+    RAW_IMAGE && LOOP_IMAGE
+  elif [ "$input" = "3" ]; then
+    PART_IMAGE && FORMAT_IMAGE
+  elif [ "$input" = "4" ]; then
+    UNPACK_BOOTSTRAP && FIX_PACMAN
+  elif [ "$input" = "5" ]; then
+    MOUNT_IMAGE && CREATE_CHROOT
+  elif [ "$input" = "6" ]; then
+    BASE_CONFIG && GENERATE_ENTROPY
+  elif [ "$input" = "7" ]; then
+    CORE_INSTALL && UPDATE_KERNEL
+  elif [ "$input" = "8" ]; then
+    ENTER_CHROOT; CLEAN_UP
+  elif [ "$input" = "9" ]; then
+    NSPAWN_BOOT && CLEAN_UP
+  fi
+done
 
 CLEAN_UP
-du -s --si "${buildDir}/$imgFile"
-echo -e "\033[1m:::::> [DONE]\033[0m"
 
 ### END ###
